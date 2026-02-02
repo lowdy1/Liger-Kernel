@@ -47,7 +47,7 @@ def _prepare_freqs(freqs_cis: torch.Tensor, seq_len: int, head_dim_half: int):
     return freqs_real, freqs_imag
 
 
-def _cast_and_contiguous(q, k, freqs_real, freqs_imag):
+def _cast_and_contiguous(q, k, freqs_complex):
     # Align dtype: fp32 only when q is fp32; otherwise keep q dtype for perf
     compute_dtype = torch.float32 if q.dtype == torch.float32 else q.dtype
 
@@ -56,17 +56,15 @@ def _cast_and_contiguous(q, k, freqs_real, freqs_imag):
 
     q = q.to(compute_dtype).contiguous()
     k = k.to(compute_dtype).contiguous()
-    freqs_real = freqs_real.to(compute_dtype).contiguous()
-    freqs_imag = freqs_imag.to(compute_dtype).contiguous()
-    return q, k, freqs_real, freqs_imag, compute_dtype
+    freqs_complex = freqs_complex.contiguous()
+    return q, k, freqs_complex, compute_dtype
 
-
+        
 @triton.jit
 def _triton_llama4_rope_npu(
     q_ptr,
     k_ptr,
-    freqs_real_ptr,
-    freqs_imag_ptr,
+    freqs_complex_ptr,
     q_row_stride,
     k_row_stride,
     q_head_stride,
@@ -84,8 +82,7 @@ def _triton_llama4_rope_npu(
     """
     Llama4 RoPE on Ascend NPU for interleaved complex layout:
     - q/k shape: (bs, sl, n_heads, hd)
-    - last dim layout: [real0, imag0, real1, imag1, ...]
-    - freqs_real/imag: (sl, hd//2)
+    - freqs_complex_ptr: (bs, sl, hd//2)
     """
     pid = tl.program_id(0).to(tl.int64)
     batch_idx = pid // sl
@@ -101,11 +98,16 @@ def _triton_llama4_rope_npu(
     hd_idx = tl.arange(0, hd)
     hd_mask = hd_idx < (hd)
 
-    freq_idx = tl.arange(0, hd // 2)
-    freq_mask = freq_idx < (hd // 2)
+    freq_idx = tl.arange(0, hd)
+    freq_mask = freq_idx < (hd)
 
-    freqs_real = tl.load(freqs_real_ptr + freq_base + freq_idx, mask=freq_mask, other=0.0)
-    freqs_imag = tl.load(freqs_imag_ptr + freq_base + freq_idx, mask=freq_mask, other=0.0) * imag_sign
+    freqs_complex_ptr = tl.load(freqs_complex_ptr + freq_base + freq_idx, mask=freq_mask, other=0.0)
+    
+    freqs_complex_ptr = freqs_complex_ptr.reshape(hd // 2, 2, can_reorder=True)
+    freqs_real, freqs_imag = tl.split(freqs_complex_ptr)
+    freqs_imag = freqs_imag * imag_sign
+
+    
 
     # Q heads (chunked for UB)
     for qh_block in range(0, n_qh, BLOCK_Q):
@@ -152,7 +154,6 @@ def _triton_llama4_rope_npu(
 
         tl.store(head_ptr + hd_idx[None, :], new_k_pair, mask=block_mask)
 
-
 def llama4_rope_forward(q, k, freqs_cis):
     """
     Ascend NPU implementation of Llama4 RoPE.
@@ -166,10 +167,11 @@ def llama4_rope_forward(q, k, freqs_cis):
     _, _, n_kh, _ = k.shape
     if hd % 2 != 0:
         raise ValueError(f"head_dim must be even for interleaved complex layout, got {hd}")
-    hd_half = hd // 2
 
-    freqs_real, freqs_imag = _prepare_freqs(freqs_cis, sl, hd_half)
-    q, k, freqs_real, freqs_imag, compute_dtype = _cast_and_contiguous(q, k, freqs_real, freqs_imag)
+    if freqs_cis.is_complex():
+        freqs_cis = torch.view_as_real(freqs_cis)
+
+    q, k, freqs_cis, compute_dtype = _cast_and_contiguous(q, k, freqs_cis)
 
     # UB tiling strategy: tile heads dimension only
     dtype_size = q.element_size()
@@ -192,16 +194,17 @@ def llama4_rope_forward(q, k, freqs_cis):
 
     n_row = bs * sl
 
+
+
     _triton_llama4_rope_npu[(n_row,)](
         q,
         k,
-        freqs_real,
-        freqs_imag,
+        freqs_cis,
         q.stride(1),
         k.stride(1),
         q.stride(2),
         k.stride(2),
-        freqs_real.stride(0),
+        freqs_cis.stride(1),
         sl,
         bs,
         n_qh,
@@ -231,10 +234,11 @@ def llama4_rope_backward(dq, dk, freqs_cis):
     _, _, n_kh, _ = dk.shape
     if hd % 2 != 0:
         raise ValueError(f"head_dim must be even for interleaved complex layout, got {hd}")
-    hd_half = hd // 2
 
-    freqs_real, freqs_imag = _prepare_freqs(freqs_cis, sl, hd_half)
-    dq, dk, freqs_real, freqs_imag, compute_dtype = _cast_and_contiguous(dq, dk, freqs_real, freqs_imag)
+    if freqs_cis.is_complex():
+        freqs_cis = torch.view_as_real(freqs_cis)
+
+    dq, dk, freqs_cis, compute_dtype = _cast_and_contiguous(dq, dk, freqs_cis)
 
     # UB tiling strategy: tile heads dimension only
     dtype_size = dq.element_size()
@@ -257,16 +261,16 @@ def llama4_rope_backward(dq, dk, freqs_cis):
 
     n_row = bs * sl
 
+
     _triton_llama4_rope_npu[(n_row,)](
         dq,
         dk,
-        freqs_real,
-        freqs_imag,
+        freqs_cis,
         dq.stride(1),
         dk.stride(1),
         dq.stride(2),
         dk.stride(2),
-        freqs_real.stride(0),
+        freqs_cis.stride(1),
         sl,
         bs,
         n_qh,
