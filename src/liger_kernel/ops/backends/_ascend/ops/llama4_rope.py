@@ -5,48 +5,6 @@ import triton.language as tl
 from liger_kernel.ops.backends._ascend.ub_manager import compute_default_tiling_strategy
 
 
-def _prepare_freqs(freqs_cis: torch.Tensor, seq_len: int, head_dim_half: int):
-    """
-    Canonicalize freqs to (seq_len, head_dim_half) real/imag tensors.
-
-    Supports:
-    - complex freqs: (..., head_dim_half) complex -> real/imag
-    - packed freqs: (..., 2*head_dim_half) real -> split into real/imag
-    """
-    if freqs_cis.is_complex():
-        freqs_real = freqs_cis.real
-        freqs_imag = freqs_cis.imag
-    else:
-        if freqs_cis.shape[-1] == 2 * head_dim_half:
-            freqs_real = freqs_cis[..., :head_dim_half]
-            freqs_imag = freqs_cis[..., head_dim_half:]
-        else:
-            raise ValueError(
-                f"Unexpected freqs_cis shape for non-complex input: {freqs_cis.shape}, "
-                f"expected last dim = {2 * head_dim_half}"
-            )
-
-    if freqs_real.shape[-1] != head_dim_half:
-        raise ValueError(f"Unexpected last dim for freqs: {freqs_real.shape[-1]} (expected {head_dim_half})")
-
-    # Flatten leading dims -> (N, head_dim_half)
-    freqs_real = freqs_real.reshape(-1, head_dim_half)
-    freqs_imag = freqs_imag.reshape(-1, head_dim_half)
-
-    # Broadcast/slice to (seq_len, head_dim_half)
-    if freqs_real.shape[0] < seq_len:
-        if freqs_real.shape[0] == 1:
-            freqs_real = freqs_real.expand(seq_len, -1)
-            freqs_imag = freqs_imag.expand(seq_len, -1)
-        else:
-            raise ValueError(f"Insufficient rows in freqs: {freqs_real.shape[0]} < seq_len={seq_len}")
-    elif freqs_real.shape[0] > seq_len:
-        freqs_real = freqs_real[:seq_len]
-        freqs_imag = freqs_imag[:seq_len]
-
-    return freqs_real, freqs_imag
-
-
 def _cast_and_contiguous(q, k, freqs_complex):
     # Align dtype: fp32 only when q is fp32; otherwise keep q dtype for perf
     compute_dtype = torch.float32 if q.dtype == torch.float32 else q.dtype
@@ -59,7 +17,7 @@ def _cast_and_contiguous(q, k, freqs_complex):
     freqs_complex = freqs_complex.contiguous()
     return q, k, freqs_complex, compute_dtype
 
-        
+
 @triton.jit
 def _triton_llama4_rope_npu(
     q_ptr,
@@ -102,12 +60,10 @@ def _triton_llama4_rope_npu(
     freq_mask = freq_idx < (hd)
 
     freqs_complex_ptr = tl.load(freqs_complex_ptr + freq_base + freq_idx, mask=freq_mask, other=0.0)
-    
+
     freqs_complex_ptr = freqs_complex_ptr.reshape(hd // 2, 2, can_reorder=True)
     freqs_real, freqs_imag = tl.split(freqs_complex_ptr)
     freqs_imag = freqs_imag * imag_sign
-
-    
 
     # Q heads (chunked for UB)
     for qh_block in range(0, n_qh, BLOCK_Q):
@@ -154,6 +110,7 @@ def _triton_llama4_rope_npu(
 
         tl.store(head_ptr + hd_idx[None, :], new_k_pair, mask=block_mask)
 
+
 def llama4_rope_forward(q, k, freqs_cis):
     """
     Ascend NPU implementation of Llama4 RoPE.
@@ -193,8 +150,6 @@ def llama4_rope_forward(q, k, freqs_cis):
         BLOCK_K = triton.next_power_of_2(n_kh)
 
     n_row = bs * sl
-
-
 
     _triton_llama4_rope_npu[(n_row,)](
         q,
@@ -260,7 +215,6 @@ def llama4_rope_backward(dq, dk, freqs_cis):
         BLOCK_K = triton.next_power_of_2(n_kh)
 
     n_row = bs * sl
-
 
     _triton_llama4_rope_npu[(n_row,)](
         dq,
