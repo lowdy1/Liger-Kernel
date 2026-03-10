@@ -2,8 +2,37 @@ import torch
 import triton
 import triton.language as tl
 
+from liger_kernel.ops.backends._ascend.ub_manager import compute_default_tiling_strategy
 from liger_kernel.ops.utils import ensure_contiguous
 from liger_kernel.ops.utils import get_npu_core_count
+
+
+@triton.jit
+def _softmax_forward_kernel(Y_ptr, X_ptr, X_row_stride, Y_row_stride, n_rows, n_cols, BLOCK_SIZE: tl.constexpr):
+    """
+    Single-pass softmax forward kernel for rows that fit within one Triton block.
+    Computes the softmax in one pass by loading the entire row into registers.
+    """
+    row_start = tl.program_id(0)
+    num_prog = tl.num_programs(0)
+    row_step = tl.cdiv(n_rows, num_prog)
+
+    for row_idx in tl.range(row_start, n_rows, row_step):
+        row_start_ptr = X_ptr + row_idx * X_row_stride
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        X_ptrs = row_start_ptr + col_offsets
+
+        mask = col_offsets < n_cols
+        row = tl.load(X_ptrs, mask=mask, other=-float("inf"))
+
+        row_minus_max = row - tl.max(row, axis=0)
+        numerator = tl.exp(row_minus_max)
+        denominator = tl.sum(numerator, axis=0)
+        softmax_output = numerator / denominator
+
+        output_row_start_ptr = Y_ptr + row_idx * Y_row_stride
+        output_ptrs = output_row_start_ptr + col_offsets
+        tl.store(output_ptrs, softmax_output, mask=mask)
 
 
 @triton.jit
@@ -21,18 +50,10 @@ def _softmax_multi_block_forward_kernel(
 
     First pass computes max and sum for numerical stability.
     Second pass normalizes and writes output.
-
-    Args:
-        Y_ptr: Output tensor pointer
-        Y_row_stride: Stride for output rows
-        X_ptr: Input tensor pointer
-        X_row_stride: Stride for input rows
-        n_rows: Number of rows to process
-        n_cols: Number of columns per row
-        BLOCK_SIZE: Block size for column processing
     """
     row_start = tl.program_id(0)
-    row_step = tl.num_programs(0)
+    num_prog = tl.num_programs(0)
+    row_step = tl.cdiv(n_rows, num_prog)
 
     for row_idx in tl.range(row_start, n_rows, row_step):
         row_start_ptr = X_ptr + row_idx * X_row_stride
@@ -62,6 +83,42 @@ def _softmax_multi_block_forward_kernel(
 
 
 @triton.jit
+def _softmax_backward_kernel(
+    dX_ptr,
+    dY_ptr,
+    Y_ptr,
+    dY_row_stride,
+    Y_row_stride,
+    dX_row_stride,
+    n_rows,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_start = tl.program_id(0)
+    num_prog = tl.num_programs(0)
+    row_step = tl.cdiv(n_rows, num_prog)
+
+    for row_idx in tl.range(row_start, n_rows, row_step):
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+
+        dy_row_ptr = dY_ptr + row_idx * dY_row_stride
+        y_row_ptr = Y_ptr + row_idx * Y_row_stride
+        dx_row_ptr = dX_ptr + row_idx * dX_row_stride
+
+        dy_ptrs = dy_row_ptr + col_offsets
+        y_ptrs = y_row_ptr + col_offsets
+        dx_ptrs = dx_row_ptr + col_offsets
+
+        dy = tl.load(dy_ptrs, mask=mask, other=0.0)
+        y = tl.load(y_ptrs, mask=mask, other=0.0)
+
+        dot = tl.sum(dy * y, axis=0)
+        dx = y * (dy - dot)
+        tl.store(dx_ptrs, dx, mask=mask)
+
+
+@triton.jit
 def _softmax_multi_block_backward_kernel(
     dy_ptr,
     dy_stride,
@@ -73,30 +130,16 @@ def _softmax_multi_block_backward_kernel(
     n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    Multi-block softmax backward kernel using two-pass algorithm.
-
-    Computes gradient: dx = y * (dy - sum(dy * y))
-
-    Args:
-        dy_ptr: Gradient output pointer
-        dy_stride: Stride for gradient output rows
-        y_ptr: Forward output pointer
-        y_stride: Stride for forward output rows
-        dx_ptr: Gradient input pointer
-        dx_stride: Stride for gradient input rows
-        n_rows: Number of rows to process
-        n_cols: Number of columns per row
-        BLOCK_SIZE: Block size for column processing
-    """
     row_start = tl.program_id(0)
+    num_prog = tl.num_programs(0)
+    row_step = tl.cdiv(n_rows, num_prog)
+
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    acc = 0.0
-    row_step = tl.num_programs(0)
 
     for row_idx in tl.range(row_start, n_rows, row_step):
         dy_start_ptr = dy_ptr + row_idx * dy_stride
         y_start_ptr = y_ptr + row_idx * y_stride
+        acc = 0.0
 
         for start in tl.range(0, n_cols, BLOCK_SIZE):
             idx = start + col_offsets
@@ -116,30 +159,52 @@ def _softmax_multi_block_backward_kernel(
             tl.store(dx_ptr + row_idx * dx_stride + idx, dx_blk, mask=mask, cache_modifier=".wb")
 
 
-def softmax_forward(x):
+def get_optimal_block_size(n_cols):
+    if n_cols <= 4096:
+        return triton.next_power_of_2(n_cols)
+
+    memory_multiplier = 4.0
+    tile_shapes = compute_default_tiling_strategy(
+        safety_margin=0.9,
+        dtype_size=4,
+        memory_multiplier=memory_multiplier,
+        shapes=((n_cols,),),
+        tiling_dims=(0,),
+    )
+
+    if tile_shapes and len(tile_shapes) > 0:
+        block_size = tile_shapes[0][0]
+        return max(4096, block_size)
+    else:
+        return 4096
+
+
+def _softmax_forward(x):
     *batch, n_cols = x.shape
     x2d = x.contiguous().view(-1, n_cols)
     n_rows = x2d.shape[0]
-    MAX_FUSED_BLOCK_SIZE = 8192
-
-    BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    BLOCK_SIZE = min(BLOCK_SIZE, MAX_FUSED_BLOCK_SIZE)
+    BLOCK_SIZE = get_optimal_block_size(n_cols)
 
     y2d = torch.empty_like(x2d)
     num_cores = get_npu_core_count()
     num_programs = min(num_cores, n_rows)
 
-    _softmax_multi_block_forward_kernel[(num_programs,)](
-        y2d, y2d.stride(0), x2d, x2d.stride(0), n_rows, n_cols, BLOCK_SIZE=BLOCK_SIZE
-    )
+    if n_cols <= BLOCK_SIZE:
+        _softmax_forward_kernel[(num_programs,)](y2d, x2d, x2d.stride(0), y2d.stride(0), n_rows, n_cols, BLOCK_SIZE)
+        multi_block_launch = False
+    else:
+        _softmax_multi_block_forward_kernel[(num_programs,)](
+            y2d, y2d.stride(0), x2d, x2d.stride(0), n_rows, n_cols, BLOCK_SIZE=BLOCK_SIZE
+        )
+        multi_block_launch = True
+    return y2d.view(*batch, n_cols), BLOCK_SIZE, multi_block_launch
 
-    return y2d.view(*batch, n_cols), BLOCK_SIZE
 
-
-def softmax_backward(
+def _softmax_backward(
     dy: torch.Tensor,
     y: torch.Tensor,
     BLOCK_SIZE: int,
+    multi_block_launch: bool,
 ) -> torch.Tensor:
     *batch, n_cols = dy.shape
     dy2d = dy.contiguous().view(-1, n_cols)
@@ -150,17 +215,30 @@ def softmax_backward(
     num_cores = get_npu_core_count()
     num_programs = min(num_cores, n_rows)
 
-    _softmax_multi_block_backward_kernel[(num_programs,)](
-        dy2d,
-        dy2d.stride(0),
-        y2d,
-        y2d.stride(0),
-        dx2d,
-        dx2d.stride(0),
-        n_rows,
-        n_cols,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    if not multi_block_launch and n_cols <= BLOCK_SIZE:
+        _softmax_backward_kernel[(num_programs,)](
+            dx2d,
+            dy2d,
+            y2d,
+            dy2d.stride(0),
+            y2d.stride(0),
+            dx2d.stride(0),
+            n_rows,
+            n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+    else:
+        _softmax_multi_block_backward_kernel[(num_programs,)](
+            dy2d,
+            dy2d.stride(0),
+            y2d,
+            y2d.stride(0),
+            dx2d,
+            dx2d.stride(0),
+            n_rows,
+            n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
 
     return dx2d.view(*batch, n_cols)
 
@@ -169,18 +247,20 @@ class LigerSoftmaxFunction(torch.autograd.Function):
     @staticmethod
     @ensure_contiguous
     def forward(ctx, input_: torch.Tensor):
-        y, BLOCK_SIZE = softmax_forward(input_)
+        y, BLOCK_SIZE, multi_block_launch = _softmax_forward(input_)
         ctx.save_for_backward(y)
         ctx.BLOCK_SIZE = BLOCK_SIZE
+        ctx.multi_block_launch = multi_block_launch
         return y
 
     @staticmethod
     @ensure_contiguous
     def backward(ctx, grad_output):
         (y,) = ctx.saved_tensors
-        dx = softmax_backward(
+        dx = _softmax_backward(
             grad_output,
             y,
             ctx.BLOCK_SIZE,
+            ctx.multi_block_launch,
         )
         return dx
